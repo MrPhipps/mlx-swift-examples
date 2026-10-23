@@ -115,9 +115,70 @@ public struct StableDiffusionConfiguration: Sendable {
         @Sendable (HubApi, StableDiffusionConfiguration, LoadConfiguration) throws ->
             StableDiffusion
 
+    /// When set, file resolution reads from this local directory instead of the Hub
+    /// cache location for ``id`` -- lets a configuration point at a model that was
+    /// never downloaded from the Hub at all (a custom/local diffusers-format
+    /// checkpoint). ``download(hub:progressHandler:)`` is a no-op when this is set,
+    /// since there's nothing to fetch.
+    let localDirectoryOverride: URL?
+
+    // Memberwise init explicitly declared (rather than relying on the default
+    // synthesized one) so existing call sites that don't mention
+    // `localDirectoryOverride` keep compiling unchanged.
+    init(
+        id: String, files: [FileKey: String],
+        defaultParameters: @escaping @Sendable () -> EvaluateParameters,
+        localDirectoryOverride: URL? = nil,
+        factory: @escaping @Sendable (HubApi, StableDiffusionConfiguration, LoadConfiguration) throws ->
+            StableDiffusion
+    ) {
+        self.id = id
+        self.files = files
+        self.defaultParameters = defaultParameters
+        self.localDirectoryOverride = localDirectoryOverride
+        self.factory = factory
+    }
+
+    /// A configuration for a custom diffusers-format model already present on disk
+    /// (e.g. converted from a CompVis-format `.ckpt` with diffusers' own
+    /// `convert_original_stable_diffusion_to_diffusers.py`). `directory` must contain
+    /// the standard SD1.x/2.x layout: `unet/`, `vae/`, `text_encoder/`, `scheduler/`,
+    /// `tokenizer/`.
+    public static func local(
+        id: String, directory: URL,
+        defaultParameters: @escaping @Sendable () -> EvaluateParameters
+    ) -> StableDiffusionConfiguration {
+        StableDiffusionConfiguration(
+            id: id,
+            files: [
+                .unetConfig: "unet/config.json",
+                .unetWeights: "unet/diffusion_pytorch_model.safetensors",
+                .textEncoderConfig: "text_encoder/config.json",
+                .textEncoderWeights: "text_encoder/model.safetensors",
+                .vaeConfig: "vae/config.json",
+                .vaeWeights: "vae/diffusion_pytorch_model.safetensors",
+                .diffusionConfig: "scheduler/scheduler_config.json",
+                .tokenizerVocabulary: "tokenizer/vocab.json",
+                .tokenizerMerges: "tokenizer/merges.txt",
+            ],
+            defaultParameters: defaultParameters,
+            localDirectoryOverride: directory,
+            factory: { hub, sdConfiguration, loadConfiguration in
+                let sd = try StableDiffusionBase(
+                    hub: hub, configuration: sdConfiguration, dType: loadConfiguration.dType)
+                if loadConfiguration.quantize {
+                    quantize(model: sd.textEncoder, filter: { k, m in m is Linear })
+                    quantize(model: sd.unet, groupSize: 32, bits: 8)
+                }
+                return sd
+            }
+        )
+    }
+
     public func download(
         hub: HubApi = HubApi(), progressHandler: @escaping (Progress) -> Void = { _ in }
     ) async throws {
+        guard localDirectoryOverride == nil else { return }
         let repo = Hub.Repo(id: self.id)
         try await hub.snapshot(
             from: repo, matching: Array(files.values), progressHandler: progressHandler)
@@ -376,8 +437,9 @@ func loadWeights(
 func resolve(hub: HubApi, configuration: StableDiffusionConfiguration, key: FileKey) -> URL {
     precondition(
         configuration.files[key] != nil, "configuration \(configuration.id) missing key: \(key)")
-    let repo = Hub.Repo(id: configuration.id)
-    let directory = hub.localRepoLocation(repo)
+    let directory =
+        configuration.localDirectoryOverride
+        ?? hub.localRepoLocation(Hub.Repo(id: configuration.id))
     return directory.appending(component: configuration.files[key]!)
 }
 
