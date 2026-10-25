@@ -48,10 +48,26 @@ public struct EvaluateParameters: Sendable {
     public var prompt = ""
     public var negativePrompt = ""
 
+    /// Which sampler steps the denoising loop. `nil` keeps the model's built-in
+    /// sampler (Euler for the SD1.x/2.x base path) -- the behavior before this
+    /// option existed.
+    public var sampler: SamplerKind?
+
+    /// How prompts are tokenized/padded before the text encoder.
+    public var textPadding: TextPadding = .longest
+
+    /// Optional starting latent `x_T`, flattened NHWC
+    /// (`imageCount * latentSize[0] * latentSize[1] * latentChannels` values),
+    /// used instead of sampling the prior. Lets callers reuse one starting noise
+    /// across prompts (CompVis `--fixed_code`) or inject noise from another
+    /// implementation for parity checks. The seed still drives any per-step noise.
+    public var initialLatent: [Float]?
+
     public init(
         cfgWeight: Float, steps: Int, imageCount: Int = 1, decodingBatchSize: Int = 1,
         latentSize: [Int] = [64, 64], seed: UInt64? = nil, prompt: String = "",
-        negativePrompt: String = ""
+        negativePrompt: String = "", sampler: SamplerKind? = nil,
+        textPadding: TextPadding = .longest, initialLatent: [Float]? = nil
     ) {
         self.cfgWeight = cfgWeight
         self.steps = steps
@@ -61,7 +77,36 @@ public struct EvaluateParameters: Sendable {
         self.seed = seed ?? UInt64(Date.timeIntervalSinceReferenceDate * 1000)
         self.prompt = prompt
         self.negativePrompt = negativePrompt
+        self.sampler = sampler
+        self.textPadding = textPadding
+        self.initialLatent = initialLatent
     }
+}
+
+/// Sampler selection for ``EvaluateParameters/sampler``.
+public enum SamplerKind: Sendable, Equatable {
+    /// Deterministic Euler (this package's original sampler).
+    case euler
+    /// Euler with ancestral noise each step.
+    case eulerAncestral
+    /// DDIM exactly as CompVis `ldm.models.diffusion.ddim` runs it: timesteps
+    /// `range(0, T, T / steps) + 1` (note: one extra step when `T` isn't divisible
+    /// by `steps`, e.g. 23 steps -> 24, matching CompVis), `eta` = 0 deterministic.
+    case ddim(eta: Float)
+    /// PLMS exactly as CompVis `ldm.models.diffusion.plms` runs it (same
+    /// timesteps as DDIM, one extra UNet evaluation on the first step).
+    case plms
+}
+
+/// Prompt padding for ``EvaluateParameters/textPadding``.
+public enum TextPadding: Sendable, Equatable {
+    /// Pad to the longer of prompt/negative prompt with token 0 -- this
+    /// package's original behavior.
+    case longest
+    /// Truncate to `length` tokens (keeping start/end tokens) and pad with
+    /// `padToken` up to `length`, as CompVis and diffusers do (`length` 77; pad
+    /// token `<|endoftext|>` for SD1.x, `!` (0) for SD2.x's OpenCLIP tokenizer).
+    case maxLength(Int, padToken: Int32)
 }
 
 /// File types for ``StableDiffusionConfiguration/files``. Used by the presets to provide

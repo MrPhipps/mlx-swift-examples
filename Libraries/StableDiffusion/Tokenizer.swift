@@ -33,7 +33,7 @@ struct Bigram: Hashable {
 ///
 /// Ideally this would be a tokenizer from `swift-transformers` but this is too special purpose to be representable in
 /// what exists there (at time of writing).
-class CLIPTokenizer {
+public class CLIPTokenizer {
 
     let pattern =
         #/<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+/#
@@ -43,12 +43,25 @@ class CLIPTokenizer {
     let bos = "<|startoftext|>"
     let eos = "<|endoftext|>"
 
-    let bosToken: Int
-    let eosToken: Int
+    public let bosToken: Int
+    public let eosToken: Int
 
     var cache = [String: [String]]()
 
-    init(merges: [String], vocabulary: [String: Int]) {
+    /// Loads a Hugging Face-style CLIP tokenizer: `vocab.json` plus `merges.txt`
+    /// (whose first line is a `#version` comment). The same BPE the Stable
+    /// Diffusion text encoder and OpenAI CLIP use.
+    public convenience init(vocabularyURL: URL, mergesURL: URL) throws {
+        let vocabulary = try JSONDecoder().decode(
+            [String: Int].self, from: Data(contentsOf: vocabularyURL))
+        let merges = try String(contentsOf: mergesURL, encoding: .utf8)
+            .components(separatedBy: .newlines)
+            .dropFirst()
+            .filter { !$0.isEmpty }
+        self.init(merges: Array(merges), vocabulary: vocabulary)
+    }
+
+    public init(merges: [String], vocabulary: [String: Int]) {
         self.bpeRanks = Dictionary(
             uniqueKeysWithValues:
                 merges

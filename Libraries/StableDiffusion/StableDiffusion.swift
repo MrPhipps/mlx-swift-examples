@@ -25,13 +25,17 @@ public struct DenoiseIterator: Sequence, IteratorProtocol {
 
     var i: Int
     let steps: [(MLXArray, MLXArray)]
+    let sampler: SimpleEulerSampler
 
     init(
         sd: StableDiffusion, xt: MLXArray, t: Int, conditioning: MLXArray, steps: Int,
-        cfgWeight: Float, textTime: (MLXArray, MLXArray)? = nil
+        cfgWeight: Float, textTime: (MLXArray, MLXArray)? = nil,
+        sampler: SimpleEulerSampler? = nil
     ) {
         self.sd = sd
-        self.steps = sd.sampler.timeSteps(steps: steps, start: t, dType: sd.dType)
+        let sampler = sampler ?? sd.sampler
+        self.sampler = sampler
+        self.steps = sampler.timeSteps(steps: steps, start: t, dType: sd.dType)
         self.i = 0
         self.xt = xt
         self.conditioning = conditioning
@@ -53,7 +57,7 @@ public struct DenoiseIterator: Sequence, IteratorProtocol {
 
         xt = sd.step(
             xt: xt, t: t, tPrev: tPrev, conditioning: conditioning, cfgWeight: cfgWeight,
-            textTime: textTime)
+            textTime: textTime, sampler: sampler)
         return xt
     }
 }
@@ -244,22 +248,44 @@ open class StableDiffusion {
         eval(unet, textEncoder, autoencoder)
     }
 
-    func tokenize(tokenizer: CLIPTokenizer, text: String, negativeText: String?) -> MLXArray {
+    func tokenize(
+        tokenizer: CLIPTokenizer, text: String, negativeText: String?,
+        padding: TextPadding = .longest
+    ) -> MLXArray {
         var tokens = [tokenizer.tokenize(text: text)]
         if let negativeText {
             tokens.append(tokenizer.tokenize(text: negativeText))
         }
 
+        let length: Int
+        let padToken: Int32
+        switch padding {
+        case .longest:
+            length = tokens.map { $0.count }.max() ?? 0
+            padToken = 0
+        case .maxLength(let maxLength, let pad):
+            // Keep the start token, at most `maxLength - 2` content tokens, and
+            // the end token -- the same truncation Hugging Face's CLIPTokenizer
+            // applies with `truncation=True`.
+            tokens = tokens.map { ids in
+                guard ids.count > maxLength, let first = ids.first, let last = ids.last else {
+                    return ids
+                }
+                return [first] + ids.dropFirst().prefix(maxLength - 2) + [last]
+            }
+            length = maxLength
+            padToken = pad
+        }
+
         let c = tokens.count
-        let max = tokens.map { $0.count }.max() ?? 0
         let mlxTokens = MLXArray(
             tokens
                 .map {
-                    ($0 + Array(repeating: 0, count: max - $0.count))
+                    ($0 + Array(repeating: padToken, count: length - $0.count))
                 }
                 .flatMap { $0 }
         )
-        .reshaped(c, max)
+        .reshaped(c, length)
 
         return mlxTokens
     }
@@ -267,6 +293,15 @@ open class StableDiffusion {
     open func step(
         xt: MLXArray, t: MLXArray, tPrev: MLXArray, conditioning: MLXArray, cfgWeight: Float,
         textTime: (MLXArray, MLXArray)?
+    ) -> MLXArray {
+        step(
+            xt: xt, t: t, tPrev: tPrev, conditioning: conditioning, cfgWeight: cfgWeight,
+            textTime: textTime, sampler: sampler)
+    }
+
+    func step(
+        xt: MLXArray, t: MLXArray, tPrev: MLXArray, conditioning: MLXArray, cfgWeight: Float,
+        textTime: (MLXArray, MLXArray)?, sampler: SimpleEulerSampler
     ) -> MLXArray {
         let xtUnet = cfgWeight > 1 ? concatenated([xt, xt], axis: 0) : xt
         let tUnet = broadcast(t, to: [xtUnet.count])
@@ -303,12 +338,16 @@ open class StableDiffusionBase: StableDiffusion, TextToImageGenerator {
         try super.init(hub: hub, configuration: configuration, dType: dType)
     }
 
-    func conditionText(text: String, imageCount: Int, cfgWeight: Float, negativeText: String?)
+    func conditionText(
+        text: String, imageCount: Int, cfgWeight: Float, negativeText: String?,
+        padding: TextPadding = .longest
+    )
         -> MLXArray
     {
         // tokenize the text
         let tokens = tokenize(
-            tokenizer: tokenizer, text: text, negativeText: cfgWeight > 1 ? negativeText : nil)
+            tokenizer: tokenizer, text: text, negativeText: cfgWeight > 1 ? negativeText : nil,
+            padding: padding)
 
         // compute the features
         var conditioning = textEncoder(tokens).lastHiddenState
@@ -326,15 +365,35 @@ open class StableDiffusionBase: StableDiffusion, TextToImageGenerator {
 
         let conditioning = conditionText(
             text: parameters.prompt, imageCount: parameters.imageCount,
-            cfgWeight: parameters.cfgWeight, negativeText: parameters.negativePrompt)
+            cfgWeight: parameters.cfgWeight, negativeText: parameters.negativePrompt,
+            padding: parameters.textPadding)
 
-        let xt = sampler.samplePrior(
-            shape: [parameters.imageCount] + parameters.latentSize + [autoencoder.latentChannels],
-            dType: dType)
+        // A fresh instance per run: PLMS keeps per-run history.
+        let sampler = parameters.sampler.map(makeSampler) ?? self.sampler
+
+        let shape = [parameters.imageCount] + parameters.latentSize + [autoencoder.latentChannels]
+        let xt: MLXArray
+        if let initialLatent = parameters.initialLatent {
+            precondition(
+                initialLatent.count == shape.reduce(1, *),
+                "initialLatent has \(initialLatent.count) values, expected \(shape) (NHWC)")
+            xt = MLXArray(initialLatent, shape).asType(dType)
+        } else {
+            xt = sampler.samplePrior(shape: shape, dType: dType)
+        }
 
         return DenoiseIterator(
             sd: self, xt: xt, t: sampler.maxTime, conditioning: conditioning,
-            steps: parameters.steps, cfgWeight: parameters.cfgWeight)
+            steps: parameters.steps, cfgWeight: parameters.cfgWeight, sampler: sampler)
+    }
+
+    func makeSampler(_ kind: SamplerKind) -> SimpleEulerSampler {
+        switch kind {
+        case .euler: SimpleEulerSampler(configuration: diffusionConfiguration)
+        case .eulerAncestral: SimpleEulerAncestralSampler(configuration: diffusionConfiguration)
+        case .ddim(let eta): DDIMSampler(configuration: diffusionConfiguration, eta: eta)
+        case .plms: PLMSSampler(configuration: diffusionConfiguration)
+        }
     }
 
 }
